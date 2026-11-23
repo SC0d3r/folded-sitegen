@@ -236,54 +236,85 @@ function findSingleStar(s, from) {
   return -1;
 }
 
+/** `s`'s code units from `from` to `to`, & < > " ' escaped, pushed into `out`. */
+function escapeRange(s, from, to, out) {
+  let last = from;
+  for (let i = from; i < to; i++) {
+    const c = s.charCodeAt(i);
+    let rep;
+    if (c === AMP) rep = '&amp;';
+    else if (c === LT) rep = '&lt;';
+    else if (c === GT) rep = '&gt;';
+    else if (c === QUOT) rep = '&quot;';
+    else if (c === APOS) rep = '&#39;';
+    else continue;
+    if (i > last) out.push(s.slice(last, i));
+    out.push(rep);
+    last = i + 1;
+  }
+  if (last < to) out.push(s.slice(last, to));
+}
+
 const SPECIAL_G = /[\\`*\[]/g;
 
 /** `s` rendered inline; `env.link(target)` is a link's href. */
 function inline(s, env) {
   if (!INLINE_SPECIAL.test(s)) return escapeHtml(s);
-  let out = '';
+  const out = [];
+  inlineInto(s, env, out);
+  return out.join('');
+}
+
+/** `s` rendered inline, its pieces pushed into `out`. */
+function inlineInto(s, env, out) {
   let last = 0;
   const n = s.length;
   SPECIAL_G.lastIndex = 0;
   let m;
   while ((m = SPECIAL_G.exec(s)) !== null) {
     const i = m.index;
-    if (i > last) out += escapeHtml(s.slice(last, i));
+    if (i > last) escapeRange(s, last, i, out);
     const c = s.charCodeAt(i);
     if (c === 92) {
       if (i + 1 < n && ESCAPABLE.has(s[i + 1])) {
-        out += escapeHtml(s[i + 1]);
+        out.push(escapeHtml(s[i + 1]));
         last = i + 2;
       } else {
-        out += '\\';
+        out.push('\\');
         last = i + 1;
       }
     } else if (c === 96) {
       const j = s.indexOf('`', i + 1);
       if (j > i + 1) {
-        out += `<code>${escapeHtml(s.slice(i + 1, j))}</code>`;
+        out.push('<code>');
+        escapeRange(s, i + 1, j, out);
+        out.push('</code>');
         last = j + 1;
       } else {
-        out += '`';
+        out.push('`');
         last = i + 1;
       }
     } else if (c === 42) {
       if (s.charCodeAt(i + 1) === 42) {
         const j = findUnescaped(s, '**', i + 2);
         if (j > i + 2) {
-          out += `<strong>${inline(s.slice(i + 2, j), env)}</strong>`;
+          out.push('<strong>');
+          inlineInto(s.slice(i + 2, j), env, out);
+          out.push('</strong>');
           last = j + 2;
         } else {
-          out += '**';
+          out.push('**');
           last = i + 2;
         }
       } else {
         const j = findSingleStar(s, i + 1);
         if (j > i + 1) {
-          out += `<em>${inline(s.slice(i + 1, j), env)}</em>`;
+          out.push('<em>');
+          inlineInto(s.slice(i + 1, j), env, out);
+          out.push('</em>');
           last = j + 1;
         } else {
-          out += '*';
+          out.push('*');
           last = i + 1;
         }
       }
@@ -293,17 +324,20 @@ function inline(s, env) {
       const mm = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
       const target = mm === -1 ? '' : s.slice(k + 2, mm);
       if (target !== '' && !/\s/.test(target)) {
-        out += `<a href="${escapeHtml(env.link(target))}">${inline(s.slice(i + 1, k), env)}</a>`;
+        out.push('<a href="');
+        out.push(escapeHtml(env.link(target)));
+        out.push('">');
+        inlineInto(s.slice(i + 1, k), env, out);
+        out.push('</a>');
         last = mm + 1;
       } else {
-        out += '[';
+        out.push('[');
         last = i + 1;
       }
     }
     SPECIAL_G.lastIndex = last;
   }
-  if (last < n) out += escapeHtml(s.slice(last));
-  return out;
+  if (last < n) escapeRange(s, last, n, out);
 }
 
 /** Whether `line` is only spaces and tabs (a blank line). */
@@ -607,10 +641,8 @@ function parseTemplate(name, src) {
 }
 
 function lookup(scope, path) {
-  let s = scope;
-  while (s !== null && !Object.hasOwn(s.vars, path[0])) s = s.parent;
-  if (s === null) return undefined;
-  let v = s.vars[path[0]];
+  if (!Object.hasOwn(scope, path[0])) return undefined;
+  let v = scope[path[0]];
   for (let k = 1; k < path.length; k++) {
     if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
     v = v[path[k]];
@@ -631,43 +663,53 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-function renderNodes(nodes, scope, ctx, depth) {
-  let out = '';
+// The renderer pushes strings into `out` and keeps one flat scope object: a for
+// saves its variable and `loop` before its body and restores them after, so an
+// iteration costs no scope object. (A `for loop in ...` collides with `loop`
+// exactly as the reference's object literal does: the loop object wins.)
+function renderNodes(nodes, scope, ctx, depth, out) {
   for (let k = 0; k < nodes.length; k++) {
     const n = nodes[k];
     switch (n.kind) {
       case 'text':
-        out += n.text;
+        out.push(n.text);
         break;
       case 'var':
-        out += ctx.escape(textOf(lookup(scope, n.path)));
+        out.push(ctx.escape(textOf(lookup(scope, n.path))));
         break;
       case 'raw':
-        out += textOf(lookup(scope, n.path));
+        out.push(textOf(lookup(scope, n.path)));
         break;
       case 'if': {
         const v = truthy(lookup(scope, n.path));
         const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) out += renderNodes(branch, scope, ctx, depth);
+        if (branch !== null) renderNodes(branch, scope, ctx, depth, out);
         break;
       }
       case 'for': {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
+        const name = n.name;
+        const hadName = Object.hasOwn(scope, name);
+        const oldName = scope[name];
+        const hadLoop = Object.hasOwn(scope, 'loop');
+        const oldLoop = scope.loop;
         for (let j = 0; j < xs.length; j++) {
-          const vars = { [n.name]: xs[j], loop: { index: j + 1, first: j === 0, last: j === xs.length - 1, length: xs.length } };
-          out += renderNodes(n.body, { vars, parent: scope }, ctx, depth);
+          scope[name] = xs[j];
+          scope.loop = { index: j + 1, first: j === 0, last: j === xs.length - 1, length: xs.length };
+          renderNodes(n.body, scope, ctx, depth, out);
         }
+        if (hadName) scope[name] = oldName; else delete scope[name];
+        if (hadLoop) scope.loop = oldLoop; else delete scope.loop;
         break;
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) out += renderNodes(t, scope, ctx, depth + 1);
+        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
         break;
       }
     }
   }
-  return out;
 }
 
 // ---------------------------------------------------------------- the build
@@ -770,27 +812,46 @@ function permalinks(b) {
 
 function markdown(b) {
   const staticPaths = new Set(b.statics.map((f) => f.path));
+  // A target's href depends only on the source's directory and the build, so a
+  // build keeps one resolution per (dir, target); a broken target still records
+  // one report line per source that names it.
+  const linkCache = new Map();
+  const resolveLink = (dir, path, target) => {
+    const key = `${dir}\u0000${target}`;
+    let r = linkCache.get(key);
+    if (r === undefined) {
+      const c0 = target.charCodeAt(0);
+      if ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) {
+        // a scheme like "https:" or a plain relative path: check the scheme
+        const m = /^[A-Za-z][A-Za-z0-9+.-]*:/.exec(target);
+        if (m !== null) {
+          linkCache.set(key, { href: target });
+          return target;
+        }
+      }
+      if (c0 === 47 || c0 === 35) {
+        linkCache.set(key, { href: target });
+        return target;
+      }
+      const hash = target.indexOf('#');
+      const rel = hash === -1 ? target : target.slice(0, hash);
+      const frag = hash === -1 ? '' : target.slice(hash);
+      const p = rel === '' ? null : resolvePath(dir, rel);
+      if (p !== null && b.bySource.has(p)) {
+        r = { href: `${b.bySource.get(p).url}${frag}` };
+      } else if (p !== null && staticPaths.has(p)) {
+        r = { href: `${b.base}/${p}${frag}` };
+      } else {
+        r = { href: target, broken: true };
+      }
+      linkCache.set(key, r);
+    }
+    if (r.broken) b.broken.add(`broken-link ${path} -> ${target}`);
+    return r.href;
+  };
   for (const s of b.sources) {
     const dir = dirOf(s.path);
-    const env = {
-      link: (target) => {
-        const c0 = target.charCodeAt(0);
-        if ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) {
-          // a scheme like "https:" or a plain relative path: check the scheme
-          const m = /^[A-Za-z][A-Za-z0-9+.-]*:/.exec(target);
-          if (m !== null) return target;
-        }
-        if (c0 === 47 || c0 === 35) return target;
-        const hash = target.indexOf('#');
-        const rel = hash === -1 ? target : target.slice(0, hash);
-        const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null && b.bySource.has(path)) return `${b.bySource.get(path).url}${frag}`;
-        if (path !== null && staticPaths.has(path)) return `${b.base}/${path}${frag}`;
-        b.broken.add(`broken-link ${s.path} -> ${target}`);
-        return target;
-      },
-    };
+    const env = { link: (target) => resolveLink(dir, s.path, target) };
     const md = renderMarkdown(s.body, env);
     s.html = md.html;
     s.toc = md.toc;
@@ -896,7 +957,11 @@ function layouts(b) {
   const ctx = { templates: b.templates, escape: escapeHtml };
   const render = (name, vars) => {
     const nodes = b.templates.get(name);
-    return nodes === undefined ? null : renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0);
+    if (nodes === undefined) return null;
+    const scope = Object.assign(Object.create(null), { site, tags: allTags, recent }, vars);
+    const out = [];
+    renderNodes(nodes, scope, ctx, 0, out);
+    return out.join('');
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
   const per = b.input.site.per_page;
@@ -930,6 +995,16 @@ function report(b) {
 
 /** One site's output tree: path -> text. */
 export function run(input) {
+  const prof = typeof process !== 'undefined' && process.env.SOLVE_PROF === '1';
+  let t = 0;
+  const lap = (label) => {
+    if (!prof) return;
+    const u = process.cpuUsage();
+    const n = (u.user + u.system) / 1000;
+    if (t !== 0) console.error(`prof ${label} ${(n - t).toFixed(0)}`);
+    t = n;
+  };
+  if (prof) lap('start');
   const templates = new Map();
   const reportLines = [];
   const names = Object.keys(input.templates).sort(byCodeUnits);
@@ -941,6 +1016,7 @@ export function run(input) {
       reportLines.push(err.message);
     }
   }
+  lap('templates');
   const b = {
     input,
     base: input.site.base_url.replace(/\/+$/, ''),
@@ -956,12 +1032,20 @@ export function run(input) {
     output: {},
   };
   readSources(b);
+  lap('readSources');
   frontMatter(b);
+  lap('frontMatter');
   permalinks(b);
+  lap('permalinks');
   markdown(b);
+  lap('markdown');
   collections(b);
+  lap('collections');
   tags(b);
+  lap('tags');
   layouts(b);
+  lap('layouts');
   report(b);
+  lap('report');
   return b.output;
 }
