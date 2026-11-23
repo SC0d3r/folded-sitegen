@@ -257,23 +257,25 @@ function escapeRange(s, from, to, out) {
 
 const SPECIAL_G = /[\\`*\[]/g;
 
+const SPECIAL_OR_ESC_G = /[\\`*\[&<>"']/g;
+
 /** `s` rendered inline; `env.link(target)` is a link's href. */
 function inline(s, env) {
-  if (!INLINE_SPECIAL.test(s)) return escapeHtml(s);
   const out = [];
   inlineInto(s, env, out);
   return out.join('');
 }
 
-/** `s` rendered inline, its pieces pushed into `out`. */
+/** `s` rendered inline, its pieces pushed into `out`. Escapes as it scans. */
 function inlineInto(s, env, out) {
   let last = 0;
   const n = s.length;
-  SPECIAL_G.lastIndex = 0;
+  const re = SPECIAL_OR_ESC_G;
+  re.lastIndex = 0;
   let m;
-  while ((m = SPECIAL_G.exec(s)) !== null) {
+  while ((m = re.exec(s)) !== null) {
     const i = m.index;
-    if (i > last) escapeRange(s, last, i, out);
+    if (i > last) out.push(s.slice(last, i));
     const c = s.charCodeAt(i);
     if (c === 92) {
       if (i + 1 < n && ESCAPABLE.has(s[i + 1])) {
@@ -318,8 +320,7 @@ function inlineInto(s, env, out) {
           last = i + 1;
         }
       }
-    } else {
-      // '['
+    } else if (c === 91) {
       const k = findUnescaped(s, ']', i + 1);
       const mm = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
       const target = mm === -1 ? '' : s.slice(k + 2, mm);
@@ -334,10 +335,13 @@ function inlineInto(s, env, out) {
         out.push('[');
         last = i + 1;
       }
+    } else {
+      out.push(c === AMP ? '&amp;' : c === LT ? '&lt;' : c === GT ? '&gt;' : c === QUOT ? '&quot;' : '&#39;');
+      last = i + 1;
     }
-    SPECIAL_G.lastIndex = last;
+    re.lastIndex = last;
   }
-  if (last < n) escapeRange(s, last, n, out);
+  if (last < n) out.push(s.slice(last, n));
 }
 
 /** Whether `line` is only spaces and tabs (a blank line). */
@@ -452,13 +456,24 @@ function endsParagraph(line) {
 }
 
 /** `src` rendered: its HTML, its table of contents and its excerpt. */
+function pushEscaped(text, out) {
+  if (!NEEDS_ESCAPE.test(text)) { out.push(text); return; }
+  escapeRange(text, 0, text.length, out);
+}
+
+/** `s` rendered inline into `out`; `env.link(target)` is a link's href. */
+function pushInline(s, env, out) {
+  inlineInto(s, env, out);
+}
+
+/** `src` rendered: its HTML, its table of contents and its excerpt. */
 function renderMarkdown(src, env) {
   const lines = src.split('\n');
   const L = lines.length;
   const ids = new Set();
   const toc = [];
   let excerpt = null;
-  let html = '';
+  const out = [];
   let i = 0;
   while (i < L) {
     const line = lines[i];
@@ -469,27 +484,35 @@ function renderMarkdown(src, env) {
     const lang = fenceOpen(line);
     if (lang !== null) {
       i++;
-      let body = '';
+      out.push('<pre><code');
+      if (lang !== '') {
+        out.push(' class="language-');
+        pushEscaped(lang, out);
+        out.push('"');
+      }
+      out.push('>');
       while (i < L && fenceOpen(lines[i]) !== '') {
-        body += `${escapeHtml(lines[i])}\n`;
+        pushEscaped(lines[i], out);
+        out.push('\n');
         i++;
       }
       i++;
-      const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
-      html += `<pre><code${cls}>${body}</code></pre>\n`;
+      out.push('</code></pre>\n');
       continue;
     }
     const h = headingOf(line);
     if (h !== null) {
       const id = uniqueSlug(slugifyCached(h.text), ids);
-      const inner = inline(h.text, env);
-      html += `<h${h.depth} id="${id}">${inner}</h${h.depth}>\n`;
-      if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html: inner });
+      out.push(`<h${h.depth} id="${id}">`);
+      const at = out.length;
+      pushInline(h.text, env, out);
+      if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html: out.slice(at).join('') });
+      out.push(`</h${h.depth}>\n`);
       i++;
       continue;
     }
     if (isHr(line)) {
-      html += '<hr>\n';
+      out.push('<hr>\n');
       i++;
       continue;
     }
@@ -502,7 +525,12 @@ function renderMarkdown(src, env) {
         if (q !== '') body.push(q);
         i++;
       }
-      html += (body.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(body.join('\n'), env)}</p>\n</blockquote>`) + '\n';
+      if (body.length === 0) out.push('<blockquote>\n</blockquote>\n');
+      else {
+        out.push('<blockquote>\n<p>');
+        pushInline(body.join('\n'), env, out);
+        out.push('</p>\n</blockquote>\n');
+      }
       continue;
     }
     const firstBullet = bulletOf(line);
@@ -523,10 +551,13 @@ function renderMarkdown(src, env) {
         } else break;
       }
       const tag = isOrdered ? 'ol' : 'ul';
-      const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
-      let body = '';
-      for (let k = 0; k < items.length; k++) body += `<li>${inline(items[k], env)}</li>\n`;
-      html += `${open}\n${body}</${tag}>\n`;
+      out.push(isOrdered && start !== 1 ? `<ol start="${start}">\n` : `<${tag}>\n`);
+      for (let k = 0; k < items.length; k++) {
+        out.push('<li>');
+        pushInline(items[k], env, out);
+        out.push('</li>\n');
+      }
+      out.push(`</${tag}>\n`);
       continue;
     }
     let text = trimLine(line);
@@ -535,11 +566,13 @@ function renderMarkdown(src, env) {
       text += `\n${trimLine(lines[i])}`;
       i++;
     }
-    const inner = inline(text, env);
-    if (excerpt === null) excerpt = inner;
-    html += `<p>${inner}</p>\n`;
+    out.push('<p>');
+    const at = out.length;
+    pushInline(text, env, out);
+    if (excerpt === null) excerpt = out.slice(at).join('');
+    out.push('</p>\n');
   }
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { html: out.join(''), toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -705,7 +738,34 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+        if (t !== undefined && depth < INCLUDE_DEPTH) {
+          const policy = ctx.policy.get(n.name);
+          if (policy !== undefined && scope.site === ctx.baseSite && scope.tags === ctx.baseTags && scope.recent === ctx.baseRecent) {
+            const d = depth + 1;
+            let slot;
+            let value;
+            if (policy.kind === 1) {
+              slot = ctx.constCache;
+              value = n.name + '\u0000' + d;
+            } else {
+              let m = ctx.memoCache.get(n.name);
+              if (m === undefined) { m = new Map(); ctx.memoCache.set(n.name, m); }
+              slot = m.get(d);
+              if (slot === undefined) { slot = new Map(); m.set(d, slot); }
+              value = scope[policy.root];
+            }
+            let s = slot.get(value);
+            if (s === undefined) {
+              const parts = [];
+              renderNodes(t, scope, ctx, d, parts);
+              s = parts.join('');
+              slot.set(value, s);
+            }
+            out.push(s);
+          } else {
+            renderNodes(t, scope, ctx, depth + 1, out);
+          }
+        }
         break;
       }
     }
@@ -812,46 +872,27 @@ function permalinks(b) {
 
 function markdown(b) {
   const staticPaths = new Set(b.statics.map((f) => f.path));
-  // A target's href depends only on the source's directory and the build, so a
-  // build keeps one resolution per (dir, target); a broken target still records
-  // one report line per source that names it.
-  const linkCache = new Map();
-  const resolveLink = (dir, path, target) => {
-    const key = `${dir}\u0000${target}`;
-    let r = linkCache.get(key);
-    if (r === undefined) {
-      const c0 = target.charCodeAt(0);
-      if ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) {
-        // a scheme like "https:" or a plain relative path: check the scheme
-        const m = /^[A-Za-z][A-Za-z0-9+.-]*:/.exec(target);
-        if (m !== null) {
-          linkCache.set(key, { href: target });
-          return target;
-        }
-      }
-      if (c0 === 47 || c0 === 35) {
-        linkCache.set(key, { href: target });
-        return target;
-      }
-      const hash = target.indexOf('#');
-      const rel = hash === -1 ? target : target.slice(0, hash);
-      const frag = hash === -1 ? '' : target.slice(hash);
-      const p = rel === '' ? null : resolvePath(dir, rel);
-      if (p !== null && b.bySource.has(p)) {
-        r = { href: `${b.bySource.get(p).url}${frag}` };
-      } else if (p !== null && staticPaths.has(p)) {
-        r = { href: `${b.base}/${p}${frag}` };
-      } else {
-        r = { href: target, broken: true };
-      }
-      linkCache.set(key, r);
-    }
-    if (r.broken) b.broken.add(`broken-link ${path} -> ${target}`);
-    return r.href;
-  };
   for (const s of b.sources) {
     const dir = dirOf(s.path);
-    const env = { link: (target) => resolveLink(dir, s.path, target) };
+    const env = {
+      link: (target) => {
+        const c0 = target.charCodeAt(0);
+        if ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) {
+          // a scheme like "https:" or a plain relative path: check the scheme
+          const m = /^[A-Za-z][A-Za-z0-9+.-]*:/.exec(target);
+          if (m !== null) return target;
+        }
+        if (c0 === 47 || c0 === 35) return target;
+        const hash = target.indexOf('#');
+        const rel = hash === -1 ? target : target.slice(0, hash);
+        const frag = hash === -1 ? '' : target.slice(hash);
+        const path = rel === '' ? null : resolvePath(dir, rel);
+        if (path !== null && b.bySource.has(path)) return `${b.bySource.get(path).url}${frag}`;
+        if (path !== null && staticPaths.has(path)) return `${b.base}/${path}${frag}`;
+        b.broken.add(`broken-link ${s.path} -> ${target}`);
+        return target;
+      },
+    };
     const md = renderMarkdown(s.body, env);
     s.html = md.html;
     s.toc = md.toc;
@@ -949,12 +990,91 @@ function pageOf(s) {
   };
 }
 
+
+const CONST_ROOTS = new Set(['site', 'tags', 'recent']);
+
+/** Which templates can be reused: constant ones, and ones that read one value. */
+function memoPolicyFor(templates) {
+  const direct = new Map();
+  for (const [name, nodes] of templates) {
+    const roots = new Set();
+    const sites = [];
+    const walk = (ns, locals) => {
+      for (let i = 0; i < ns.length; i++) {
+        const n = ns[i];
+        const k = n.kind;
+        if (k === 'var' || k === 'raw') {
+          const r = n.path[0];
+          if (!locals.has(r)) roots.add(r);
+        } else if (k === 'if') {
+          const r = n.path[0];
+          if (!locals.has(r)) roots.add(r);
+          if (n.then !== null) walk(n.then, locals);
+          if (n.else !== null) walk(n.else, locals);
+        } else if (k === 'for') {
+          const r = n.path[0];
+          if (!locals.has(r)) roots.add(r);
+          const inner = new Set(locals);
+          inner.add(n.name);
+          inner.add('loop');
+          walk(n.body, inner);
+        } else if (k === 'include') {
+          sites.push({ name: n.name, locals });
+        }
+      }
+    };
+    walk(nodes, new Set());
+    direct.set(name, { roots, sites });
+  }
+  const free = (name, outer, stack) => {
+    const d = direct.get(name);
+    if (d === undefined || stack.has(name)) return null;
+    stack.add(name);
+    const out = new Set();
+    for (const r of d.roots) if (!outer.has(r)) out.add(r);
+    for (let i = 0; i < d.sites.length; i++) {
+      const site = d.sites[i];
+      const inner = new Set(outer);
+      for (const l of site.locals) inner.add(l);
+      const sub = free(site.name, inner, stack);
+      if (sub === null) { stack.delete(name); return null; }
+      for (const r of sub) out.add(r);
+    }
+    stack.delete(name);
+    return out;
+  };
+  const policy = new Map();
+  for (const name of templates.keys()) {
+    const roots = free(name, new Set(), new Set());
+    if (roots === null) continue;
+    let dynamic = null;
+    let ok = true;
+    for (const r of roots) {
+      if (CONST_ROOTS.has(r)) continue;
+      if (dynamic !== null || r === 'loop') { ok = false; break; }
+      dynamic = r;
+    }
+    if (!ok) continue;
+    policy.set(name, dynamic === null ? { kind: 1 } : { kind: 2, root: dynamic });
+  }
+  return policy;
+}
+
 function layouts(b) {
   b.cards = new Map(b.posts.map((p) => [p, cardOf(p)]));
   const site = { title: b.input.site.title, base_url: b.base };
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
-  const ctx = { templates: b.templates, escape: escapeHtml };
+  const ctx = {
+    templates: b.templates,
+    escape: escapeHtml,
+    policy: memoPolicyFor(b.templates),
+    baseSite: site,
+    baseTags: allTags,
+    baseRecent: recent,
+    constCache: new Map(),
+    memoCache: new Map(),
+  };
   const render = (name, vars) => {
     const nodes = b.templates.get(name);
     if (nodes === undefined) return null;
